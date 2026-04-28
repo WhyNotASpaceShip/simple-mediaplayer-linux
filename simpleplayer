@@ -1,0 +1,494 @@
+#!/usr/bin/env python3
+"""
+SimplePlayer — serves a local folder of videos over HTTP with a built-in browser player.
+Zero dependencies: Python 3 stdlib only.
+
+Usage:
+    python3 player.py [FOLDER] [PORT] [--no-ffmpeg]
+
+Defaults:
+    FOLDER = current directory
+    PORT   = 8080
+
+Options:
+    --no-ffmpeg   Disable ffmpeg transcoding; serve all files directly.
+                  Use this if you want raw streaming regardless of audio codec.
+"""
+
+import argparse
+import os
+import sys
+import json
+import mimetypes
+import urllib.parse
+import socket
+import shutil
+import subprocess
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+# ─── config ────────────────────────────────────────────────────────────────────
+
+def _parse_args():
+    p = argparse.ArgumentParser(
+        description="SimplePlayer — serve a local video folder in the browser."
+    )
+    p.add_argument("folder", nargs="?", default=".",
+                   help="Folder to serve (default: current directory)")
+    p.add_argument("port",   nargs="?", type=int, default=8080,
+                   help="HTTP port (default: 8080)")
+    p.add_argument("--no-ffmpeg", action="store_true",
+                   help="Disable ffmpeg transcoding; stream all files directly")
+    return p.parse_args()
+
+_ARGS        = _parse_args()
+VIDEO_FOLDER = os.path.abspath(_ARGS.folder)
+PORT         = _ARGS.port
+
+VIDEO_EXTS   = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".flv",
+                ".ts", ".ogv", ".ogg", ".wmv", ".mpg", ".mpeg"}
+
+# Formats that commonly carry audio codecs browsers can't decode (AC3, DTS, EAC3, …).
+# When ffmpeg is available these are transcoded on-the-fly: audio→AAC, video copied.
+TRANSCODE_EXTS = {".mkv", ".avi", ".wmv", ".flv", ".mpg", ".mpeg", ".ts", ".mov"}
+
+FFMPEG = None if _ARGS.no_ffmpeg else shutil.which("ffmpeg")
+
+# ─── embedded UI ───────────────────────────────────────────────────────────────
+
+HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>SimplePlayer</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg:      #111;
+    --panel:   #1a1a1a;
+    --border:  #2c2c2c;
+    --accent:  #e50914;
+    --text:    #ddd;
+    --muted:   #666;
+    --hover:   #252525;
+    --active:  #1f1f1f;
+  }
+  html, body { height: 100%; background: var(--bg); color: var(--text);
+                font-family: system-ui, sans-serif; font-size: 14px; }
+
+  #app { display: flex; height: 100vh; }
+
+  /* ── sidebar ── */
+  #sidebar {
+    width: 300px; min-width: 220px; max-width: 400px;
+    display: flex; flex-direction: column;
+    background: var(--panel); border-right: 1px solid var(--border);
+    resize: horizontal; overflow: hidden;
+  }
+  #sidebar-header {
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--border);
+    font-weight: 700; font-size: 15px; letter-spacing: .4px;
+    color: var(--accent); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    user-select: none;
+  }
+  #search {
+    width: calc(100% - 16px); margin: 10px 8px 6px;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+    color: var(--text); padding: 6px 10px; font-size: 13px; outline: none;
+  }
+  #search:focus { border-color: var(--accent); }
+  #count { padding: 0 16px 6px; font-size: 11px; color: var(--muted); }
+  #list {
+    flex: 1; overflow-y: auto; overflow-x: hidden;
+    scrollbar-width: thin; scrollbar-color: var(--border) transparent;
+  }
+  .item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 14px; cursor: pointer; border-bottom: 1px solid var(--border);
+    transition: background .1s;
+  }
+  .item:hover  { background: var(--hover); }
+  .item.active { background: var(--active); border-left: 3px solid var(--accent); padding-left: 11px; }
+  .item-icon { font-size: 16px; flex-shrink: 0; }
+  .item-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; line-height: 1.35; }
+  .item-ext  { font-size: 10px; color: var(--muted); text-transform: uppercase; margin-top: 2px; }
+  #empty { padding: 30px 16px; color: var(--muted); text-align: center; font-size: 13px; }
+
+  /* ── player ── */
+  #player-area {
+    flex: 1; display: flex; flex-direction: column; overflow: hidden;
+  }
+  #player-header {
+    padding: 12px 18px; border-bottom: 1px solid var(--border);
+    font-size: 13px; color: var(--muted); white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis; min-height: 44px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  #player-header span { color: var(--text); font-weight: 500; }
+  #video-wrap {
+    flex: 1; display: flex; align-items: center; justify-content: center;
+    background: #000; overflow: hidden;
+  }
+  video {
+    max-width: 100%; max-height: 100%;
+    width: 100%; height: 100%; object-fit: contain;
+    outline: none;
+  }
+  #placeholder {
+    display: flex; flex-direction: column; align-items: center; gap: 16px;
+    color: var(--muted); pointer-events: none; user-select: none;
+  }
+  #placeholder .big { font-size: 64px; }
+  #placeholder p   { font-size: 15px; }
+
+  /* ── responsive ── */
+  @media (max-width: 600px) {
+    #app { flex-direction: column; }
+    #sidebar { width: 100%; max-width: 100%; height: 220px; resize: vertical; border-right: none; border-bottom: 1px solid var(--border); }
+  }
+</style>
+</head>
+<body>
+<div id="app">
+
+  <div id="sidebar">
+    <div id="sidebar-header">&#127916; SimplePlayer</div>
+    <input id="search" type="search" placeholder="Filter videos…" autocomplete="off"/>
+    <div id="count"></div>
+    <div id="list"></div>
+  </div>
+
+  <div id="player-area">
+    <div id="player-header">Select a video to play</div>
+    <div id="video-wrap">
+      <div id="placeholder">
+        <div class="big">&#127916;</div>
+        <p>No video selected</p>
+      </div>
+      <video id="video" controls preload="metadata" style="display:none"></video>
+    </div>
+  </div>
+
+</div>
+
+<script>
+const list    = document.getElementById('list');
+const search  = document.getElementById('search');
+const count   = document.getElementById('count');
+const video   = document.getElementById('video');
+const ph      = document.getElementById('placeholder');
+const header  = document.getElementById('player-header');
+
+let videos = [];
+let current = null;
+
+async function loadList() {
+  try {
+    const r = await fetch('/api/videos');
+    videos = await r.json();
+    render(videos);
+  } catch(e) {
+    list.innerHTML = '<div id="empty">Could not load video list.</div>';
+  }
+}
+
+function render(items) {
+  count.textContent = items.length + ' video' + (items.length === 1 ? '' : 's');
+  if (!items.length) {
+    list.innerHTML = '<div id="empty">No videos found in folder.</div>';
+    return;
+  }
+  list.innerHTML = items.map(v => `
+    <div class="item${v.path === current ? ' active' : ''}" data-path="${encodeURIComponent(v.path)}" data-name="${escHtml(v.name)}" title="${escHtml(v.name)}">
+      <div class="item-icon">&#127916;</div>
+      <div>
+        <div class="item-name">${escHtml(v.name)}</div>
+        <div class="item-ext">${escHtml(v.ext)} &middot; ${fmtSize(v.size)}${v.folder ? ' &middot; 📁 ' + escHtml(v.folder) : ''}</div>
+      </div>
+    </div>`).join('');
+  list.querySelectorAll('.item').forEach(el => {
+    el.addEventListener('click', () => play(decodeURIComponent(el.dataset.path), el.dataset.name));
+  });
+}
+
+function play(path, name) {
+  current = path;
+  const url = '/video/' + path.split('/').map(encodeURIComponent).join('/');
+  header.innerHTML = '<span>' + escHtml(name) + '</span>';
+  video.src = url;
+  video.style.display = 'block';
+  ph.style.display = 'none';
+  video.play().catch(() => {});
+  render(filter(search.value));   // refresh active state
+}
+
+function filter(q) {
+  const lq = q.toLowerCase();
+  return q ? videos.filter(v =>
+    v.name.toLowerCase().includes(lq) || v.folder.toLowerCase().includes(lq)
+  ) : videos;
+}
+
+search.addEventListener('input', () => render(filter(search.value)));
+
+function escHtml(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function fmtSize(b) {
+  if (!b) return '';
+  if (b < 1024)       return b + ' B';
+  if (b < 1048576)    return (b/1024).toFixed(1) + ' KB';
+  if (b < 1073741824) return (b/1048576).toFixed(1) + ' MB';
+  return (b/1073741824).toFixed(2) + ' GB';
+}
+
+// keyboard: space=pause/play, arrow keys to seek, n/p for next/prev
+document.addEventListener('keydown', e => {
+  if (e.target === search) return;
+  if (e.code === 'Space') { e.preventDefault(); video.paused ? video.play() : video.pause(); }
+  if (e.code === 'ArrowRight') { e.preventDefault(); video.currentTime += 10; }
+  if (e.code === 'ArrowLeft')  { e.preventDefault(); video.currentTime -= 10; }
+  if (e.code === 'ArrowUp')    { e.preventDefault(); video.volume = Math.min(1, video.volume + .1); }
+  if (e.code === 'ArrowDown')  { e.preventDefault(); video.volume = Math.max(0, video.volume - .1); }
+  if (e.code === 'KeyN') { e.preventDefault(); playAdjacent(1); }
+  if (e.code === 'KeyP') { e.preventDefault(); playAdjacent(-1); }
+  if (e.code === 'KeyF') { e.preventDefault(); video.requestFullscreen && video.requestFullscreen(); }
+});
+
+function playAdjacent(dir) {
+  const visible = filter(search.value);
+  if (!visible.length) return;
+  const idx = visible.findIndex(v => v.path === current);
+  const next = visible[(idx + dir + visible.length) % visible.length];
+  if (next) play(next.path, next.name);
+}
+
+// auto-play next video when current ends
+video.addEventListener('ended', () => playAdjacent(1));
+
+loadList();
+</script>
+</body>
+</html>
+"""
+
+# ─── HTTP handler ───────────────────────────────────────────────────────────────
+
+class Handler(BaseHTTPRequestHandler):
+    """Handles GET requests for the UI, video list API, and video streaming."""
+
+    def log_message(self, fmt, *args):
+        # minimal logging: just method + path + status
+        print(f"  {self.command} {self.path.split('?')[0]}  →  {args[1]}")
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path   = urllib.parse.unquote(parsed.path)
+
+        if path == "/" or path == "/index.html":
+            self._send_html(HTML.encode())
+        elif path == "/api/videos":
+            self._send_json(self._list_videos())
+        elif path.startswith("/video/"):
+            rel = path[len("/video/"):]
+            self._serve_video(rel)
+        else:
+            self._send_error(404, "Not found")
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    def _send_html(self, data: bytes):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _send_json(self, obj):
+        data = json.dumps(obj, ensure_ascii=False).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _send_error(self, code: int, msg: str):
+        body = msg.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    # ── video list ────────────────────────────────────────────────────────────
+
+    def _list_videos(self):
+        results = []
+        for dirpath, _dirs, files in os.walk(VIDEO_FOLDER):
+            # relative folder shown in UI (empty string for root)
+            rel_dir = os.path.relpath(dirpath, VIDEO_FOLDER)
+            rel_dir = "" if rel_dir == "." else rel_dir.replace(os.sep, "/")
+            for name in sorted(files, key=str.lower):
+                ext = os.path.splitext(name)[1].lower()
+                if ext not in VIDEO_EXTS:
+                    continue
+                rel_path = (rel_dir + "/" + name) if rel_dir else name
+                full     = os.path.join(dirpath, name)
+                results.append({
+                    "name":   name,
+                    "path":   rel_path,
+                    "folder": rel_dir,   # empty = root folder
+                    "ext":    ext,
+                    "size":   os.path.getsize(full),
+                })
+        # sort: folder first, then filename
+        results.sort(key=lambda v: (v["folder"].lower(), v["name"].lower()))
+        return results
+
+    # ── video streaming with range support ────────────────────────────────────
+
+    def _serve_video(self, rel: str):
+        # security: prevent directory traversal
+        safe = os.path.normpath(os.path.join(VIDEO_FOLDER, rel))
+        if not safe.startswith(VIDEO_FOLDER + os.sep) and safe != VIDEO_FOLDER:
+            self._send_error(403, "Forbidden")
+            return
+        if not os.path.isfile(safe):
+            self._send_error(404, "Video not found")
+            return
+
+        ext  = os.path.splitext(safe)[1].lower()
+
+        # Transcode formats with potentially unsupported audio (e.g. AC3/DTS in MKV)
+        if FFMPEG and ext in TRANSCODE_EXTS:
+            self._serve_transcoded(safe)
+            return
+
+        mime = mimetypes.types_map.get(ext, "video/octet-stream")
+        size = os.path.getsize(safe)
+
+        range_header = self.headers.get("Range", "")
+        start, end = 0, size - 1
+
+        if range_header:
+            try:
+                rng   = range_header.strip().removeprefix("bytes=")
+                parts = rng.split("-")
+                start = int(parts[0]) if parts[0] else 0
+                end   = int(parts[1]) if parts[1] else size - 1
+            except (ValueError, IndexError):
+                self._send_error(416, "Range Not Satisfiable")
+                return
+
+        length = end - start + 1
+
+        self.send_response(206 if range_header else 200)
+        self.send_header("Content-Type", mime)
+        self.send_header("Content-Length", str(length))
+        self.send_header("Accept-Ranges", "bytes")
+        if range_header:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.end_headers()
+
+        CHUNK = 1 << 20  # 1 MiB
+        with open(safe, "rb") as f:
+            f.seek(start)
+            remaining = length
+            while remaining > 0:
+                data = f.read(min(CHUNK, remaining))
+                if not data:
+                    break
+                try:
+                    self.wfile.write(data)
+                except (BrokenPipeError, ConnectionResetError):
+                    break
+                remaining -= len(data)
+
+
+    def _serve_transcoded(self, path: str):
+        """Stream video through ffmpeg: copy video, transcode audio → AAC.
+        Outputs fragmented MP4 so the browser can start playing immediately.
+        Byte-range seeking is not supported for transcoded streams."""
+        cmd = [
+            FFMPEG, "-loglevel", "error",
+            "-i", path,
+            "-c:v", "copy",
+            "-c:a", "aac", "-b:a", "192k",
+            "-movflags", "frag_keyframe+empty_moov",
+            "-f", "mp4",
+            "pipe:1",
+        ]
+        self.send_response(200)
+        self.send_header("Content-Type", "video/mp4")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            CHUNK = 1 << 20  # 1 MiB
+            while True:
+                data = proc.stdout.read(CHUNK)
+                if not data:
+                    break
+                self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            proc.kill()
+        finally:
+            proc.stdout.close()
+            proc.wait()
+
+
+# ─── entry point ───────────────────────────────────────────────────────────────
+
+def get_local_ip():
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("192.168.10.1", 80))
+            return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+
+
+if __name__ == "__main__":
+    if not os.path.isdir(VIDEO_FOLDER):
+        print(f"Error: '{VIDEO_FOLDER}' is not a directory.")
+        sys.exit(1)
+
+    mimetypes.add_type("video/mp4",       ".mp4")
+    mimetypes.add_type("video/mp4",       ".m4v")
+    mimetypes.add_type("video/x-matroska",".mkv")
+    mimetypes.add_type("video/webm",      ".webm")
+    mimetypes.add_type("video/x-msvideo", ".avi")
+    mimetypes.add_type("video/quicktime", ".mov")
+    mimetypes.add_type("video/mp2t",      ".ts")
+
+    server = HTTPServer(("0.0.0.0", PORT), Handler)
+    local_ip = get_local_ip()
+
+    print(f"")
+    print(f"  SimplePlayer")
+    print(f"  ────────────────────────────────────")
+    print(f"  Serving : {VIDEO_FOLDER}")
+    print(f"  Local   : http://localhost:{PORT}")
+    print(f"  Network : http://{local_ip}:{PORT}")
+    if _ARGS.no_ffmpeg:
+        print(f"  ffmpeg  : disabled via --no-ffmpeg")
+    elif FFMPEG:
+        print(f"  ffmpeg  : {FFMPEG} (MKV/AVI audio transcoding enabled)")
+    else:
+        print(f"  ffmpeg  : not found — MKV/AVI may have no audio in browser")
+    print(f"  ────────────────────────────────────")
+    print(f"  Ctrl+C to stop")
+    print(f"")
+    print(f"  Keyboard shortcuts (in browser):")
+    print(f"    Space      pause / play")
+    print(f"    ← / →      seek ±10 s")
+    print(f"    ↑ / ↓      volume ±10%")
+    print(f"    N / P      next / previous video")
+    print(f"    F          fullscreen")
+    print(f"")
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n  Stopped.")
